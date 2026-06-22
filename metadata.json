@@ -1,0 +1,6 @@
+{
+  "name": "Vision Mind Map Tool",
+  "description": "An interactive mind mapping interface designed to build, edit, and automatically convert screenshots/drawings of mind maps into fully interactive digital structures using Google's Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
