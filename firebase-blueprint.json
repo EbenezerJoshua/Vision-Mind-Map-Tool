@@ -1,0 +1,25 @@
+{
+  "collections": {
+    "users": {
+      "fields": {
+        "uid": "string",
+        "email": "string",
+        "displayName": "string",
+        "photoURL": "string",
+        "createdAt": "timestamp"
+      }
+    },
+    "mindmaps": {
+      "fields": {
+        "id": "string",
+        "userId": "string",
+        "name": "string",
+        "nodes": "array",
+        "edges": "array",
+        "direction": "string",
+        "createdAt": "timestamp",
+        "updatedAt": "timestamp"
+      }
+    }
+  }
+}

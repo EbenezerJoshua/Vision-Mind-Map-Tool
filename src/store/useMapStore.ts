@@ -1,13 +1,35 @@
 import { create } from "zustand";
 import { Connection, EdgeChange, NodeChange, addEdge, applyNodeChanges, applyEdgeChanges } from "@xyflow/react";
-import { MindMapNode, MindMapEdge, LayoutDirection, CustomNodeData } from "../types";
+import { MindMapNode, MindMapEdge, LayoutDirection } from "../types";
 import { getLayoutedElements } from "../lib/layout";
+import { db, auth } from "../lib/firebase";
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  query,
+  where,
+  orderBy,
+  serverTimestamp
+} from "firebase/firestore";
 
 interface MapStore {
   nodes: MindMapNode[];
   edges: MindMapEdge[];
   direction: LayoutDirection;
   
+  // Cloud Sync Fields
+  currentMapId: string | null;
+  currentMapName: string;
+  mapList: { id: string; name: string; updatedAt: any }[];
+  isSaving: boolean;
+  isLoadingCloud: boolean;
+  isDirty: boolean;
+
   // React Flow handlers
   onNodesChange: (changes: NodeChange[]) => void;
   onEdgesChange: (changes: EdgeChange[]) => void;
@@ -27,6 +49,17 @@ interface MapStore {
   importMapJson: (jsonString: string) => boolean;
   resetMap: () => void;
   triggerAutoSave: () => void;
+
+  // Cloud Actions
+  setCurrentMapId: (id: string | null) => void;
+  setCurrentMapName: (name: string) => void;
+  fetchUserMaps: (userId: string) => Promise<void>;
+  selectMap: (userId: string, mapId: string) => Promise<void>;
+  saveCurrentMapToCloud: (userId: string) => Promise<void>;
+  createNewCloudMap: (userId: string, name?: string) => Promise<string | null>;
+  deleteCloudMap: (userId: string, id: string) => Promise<void>;
+  renameCloudMap: (userId: string, id: string, name: string) => Promise<void>;
+  syncWithCloudAndLocal: (userId: string | null) => Promise<void>;
 }
 
 const STORAGE_KEY = "vision_mindmap_saved_state";
@@ -57,6 +90,17 @@ export const useMapStore = create<MapStore>((set, get) => {
     edges: [],
     direction: "LR",
 
+    // Cloud States
+    currentMapId: null,
+    currentMapName: "Local Map",
+    mapList: [],
+    isSaving: false,
+    isLoadingCloud: false,
+    isDirty: false,
+
+    setCurrentMapId: (id) => set({ currentMapId: id }),
+    setCurrentMapName: (name) => set({ currentMapName: name }),
+
     onNodesChange: (changes) => {
       set({
         nodes: applyNodeChanges(changes, get().nodes as any) as any,
@@ -79,7 +123,6 @@ export const useMapStore = create<MapStore>((set, get) => {
     },
 
     setElements: (nodes, edges) => {
-      // Re-bind callbacks to the incoming nodes array
       const handlers = getHandlers();
       const boundNodes = nodes.map((n) => ({
         ...n,
@@ -106,6 +149,7 @@ export const useMapStore = create<MapStore>((set, get) => {
             const dir = parsed.direction || "LR";
             set({ direction: dir });
             get().setElements(parsed.nodes, parsed.edges || []);
+            get().triggerAutoLayout(dir);
             return;
           }
         }
@@ -125,7 +169,6 @@ export const useMapStore = create<MapStore>((set, get) => {
       const handlers = getHandlers();
 
       const isHorizontal = get().direction === "LR";
-      // Position adjacent to parent initially, auto-layout will format cleanly anyway
       const offset = 150;
       const newNode: MindMapNode = {
         id: newId,
@@ -158,17 +201,14 @@ export const useMapStore = create<MapStore>((set, get) => {
         edges: [...get().edges, newEdge],
       });
 
-      // Automatically tidy up layout after addition to prevent overlapping nodes
       get().triggerAutoLayout(get().direction);
     },
 
     addSiblingNode: (sourceId) => {
-      // Sibling nodes are nodes that share the same parent as the source node
       const parentEdge = get().edges.find((e) => e.target === sourceId);
       const handlers = getHandlers();
 
       if (!parentEdge) {
-        // If there is no parent edge, creating a sibling adds a top-level child under root/center
         const rootNode = get().nodes.find((n) => n.data.isRoot);
         if (rootNode) get().addChildNode(rootNode.id);
         return;
@@ -206,9 +246,29 @@ export const useMapStore = create<MapStore>((set, get) => {
         style: { stroke: "#818cf8", strokeWidth: 2 },
       };
 
+      // Find the index of the parentEdge (the sibling we clicked)
+      const currentEdges = [...get().edges];
+      const edgeIndex = currentEdges.findIndex((e) => e.id === parentEdge.id);
+      
+      // Insert newEdge right after parentEdge
+      if (edgeIndex !== -1) {
+        currentEdges.splice(edgeIndex + 1, 0, newEdge);
+      } else {
+        currentEdges.push(newEdge);
+      }
+
+      // Find the index of the sourceId node and insert newNode right after it
+      const currentNodes = [...get().nodes];
+      const nodeIndex = currentNodes.findIndex((n) => n.id === sourceId);
+      if (nodeIndex !== -1) {
+        currentNodes.splice(nodeIndex + 1, 0, newNode);
+      } else {
+        currentNodes.push(newNode);
+      }
+
       set({
-        nodes: [...get().nodes, newNode],
-        edges: [...get().edges, newEdge],
+        nodes: currentNodes,
+        edges: currentEdges,
       });
 
       get().triggerAutoLayout(get().direction);
@@ -240,16 +300,12 @@ export const useMapStore = create<MapStore>((set, get) => {
         },
       };
 
-      // Check if targetNode has a parent currently pointing to it, i.e. edge target matches id
       let updatedEdges = [...get().edges];
       const incomingEdges = updatedEdges.filter((e) => e.target === id);
 
       if (incomingEdges.length > 0) {
-        // Splice/reroute previous incoming edges to go through the new intermediate parent
         incomingEdges.forEach((edge) => {
-          // Remove old edge: Parent -> TargetNode
           updatedEdges = updatedEdges.filter((e) => e.id !== edge.id);
-          // Add edge: Parent -> NewParent
           updatedEdges.push({
             id: `edge_${edge.source}_${newId}`,
             source: edge.source,
@@ -259,10 +315,8 @@ export const useMapStore = create<MapStore>((set, get) => {
           });
         });
       } else {
-        // If it had no parent (previous root-ish), shift root status so layout starts correctly from new parent
         if (targetNode.data.isRoot) {
           newNode.data.isRoot = true;
-          // targetNode is no longer root
           get().nodes.forEach((n) => {
             if (n.id === id) {
               n.data.isRoot = false;
@@ -271,7 +325,6 @@ export const useMapStore = create<MapStore>((set, get) => {
         }
       }
 
-      // Add edge: NewParent -> TargetNode
       const parentToChildEdge: MindMapEdge = {
         id: `edge_${newId}_${id}`,
         source: newId,
@@ -293,12 +346,10 @@ export const useMapStore = create<MapStore>((set, get) => {
       const nodeToDelete = get().nodes.find((n) => n.id === id);
       if (!nodeToDelete) return;
       if (nodeToDelete.data.isRoot) {
-        // We do not delete the root center node; we just clear its text
         get().updateNodeLabel(id, "Central Idea");
         return;
       }
 
-      // Find children and descendants of this node to delete recursively so we have clean graphs
       const descendants = getAllDescendants(id, get().edges);
       const allTargetIds = new Set([id, ...descendants]);
 
@@ -332,7 +383,6 @@ export const useMapStore = create<MapStore>((set, get) => {
       const willCollapse = !targetNode.data.isCollapsed;
 
       if (willCollapse) {
-        // Find descendants
         const descendants = getAllDescendants(id, get().edges);
         const descendantIds = new Set(descendants);
 
@@ -345,7 +395,6 @@ export const useMapStore = create<MapStore>((set, get) => {
           }),
         });
       } else {
-        // Just expand this node (children remain collapsed)
         set({
           nodes: nodes.map((n) =>
             n.id === id ? { ...n, data: { ...n.data, isCollapsed: false } } : n
@@ -371,7 +420,6 @@ export const useMapStore = create<MapStore>((set, get) => {
     },
 
     exportMapJson: () => {
-      // Export nodes and edges structure clean from react-flow temporary states
       const dataToExport = {
         direction: get().direction,
         nodes: get().nodes.map((n) => ({
@@ -397,7 +445,6 @@ export const useMapStore = create<MapStore>((set, get) => {
         const dir = parsed.direction || "LR";
         set({ direction: dir });
         
-        // Re-construct matching types
         const loadedNodes: MindMapNode[] = parsed.nodes.map((n: any) => ({
           id: n.id,
           type: "mindmap",
@@ -448,7 +495,6 @@ export const useMapStore = create<MapStore>((set, get) => {
       get().triggerAutoSave();
     },
 
-    // Side effects helper - Auto-save
     triggerAutoSave: () => {
       try {
         const payload = {
@@ -461,8 +507,341 @@ export const useMapStore = create<MapStore>((set, get) => {
           edges: get().edges,
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+        
+        // Set dirty flag to enable Manual Save button in the header
+        set({ isDirty: true });
       } catch (e) {
         console.warn("Storage write failed", e);
+      }
+    },
+
+    // CLOUD MANIFEST ACTIONS
+    fetchUserMaps: async (userId) => {
+      try {
+        const q = query(
+          collection(db, "mindmaps"),
+          where("userId", "==", userId)
+        );
+        const querySnapshot = await getDocs(q);
+        const maps = querySnapshot.docs.map((docSnap) => {
+          const data = docSnap.data();
+          let updatedAtDate: Date;
+          if (data.updatedAt && typeof data.updatedAt.toDate === "function") {
+            updatedAtDate = data.updatedAt.toDate();
+          } else if (data.updatedAt && data.updatedAt.seconds) {
+            updatedAtDate = new Date(data.updatedAt.seconds * 1000);
+          } else if (data.updatedAt) {
+            updatedAtDate = new Date(data.updatedAt);
+          } else {
+            updatedAtDate = new Date(0);
+          }
+          return {
+            id: docSnap.id,
+            name: data.name || "Untitled Mind Map",
+            updatedAt: updatedAtDate,
+          };
+        });
+
+        // Ensure maps are sorted descending by updatedAt in memory
+        maps.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+
+        set({ mapList: maps });
+      } catch (e) {
+        console.error("Error fetching user maps:", e);
+      }
+    },
+
+    selectMap: async (userId, mapId) => {
+      try {
+        set({ isLoadingCloud: true });
+        const docRef = doc(db, "mindmaps", mapId);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          const dir = data.direction || "LR";
+
+          const loadedNodes: any[] = (data.nodes || []).map((n: any) => ({
+            id: n.id,
+            type: "mindmap",
+            position: n.position || { x: 0, y: 0 },
+            data: {
+              label: n.data?.label || "Topic",
+              isRoot: !!n.data?.isRoot,
+              isCollapsed: !!n.data?.isCollapsed,
+            },
+          }));
+
+          const loadedEdges: MindMapEdge[] = (data.edges || []).map((e: any) => ({
+            ...e,
+            style: e.style || { stroke: "#6366f1", strokeWidth: 2 },
+          }));
+
+          set({
+            direction: dir,
+            currentMapId: mapId,
+            currentMapName: data.name || "Untitled Mind Map",
+            isDirty: false,
+          });
+          get().setElements(loadedNodes, loadedEdges);
+          get().triggerAutoLayout(dir);
+        }
+      } catch (e) {
+        console.error("Error selecting map:", e);
+      } finally {
+        set({ isLoadingCloud: false });
+      }
+    },
+
+    saveCurrentMapToCloud: async (userId) => {
+      const { currentMapId, currentMapName, nodes, edges, direction } = get();
+      if (!userId || !currentMapId) return;
+
+      try {
+        set({ isSaving: true });
+        const docRef = doc(db, "mindmaps", currentMapId);
+        await setDoc(docRef, {
+          id: currentMapId,
+          userId: userId,
+          name: currentMapName,
+          direction: direction,
+          nodes: nodes.map((n) => ({
+            id: n.id,
+            position: n.position,
+            data: { label: n.data.label, isRoot: !!n.data.isRoot, isCollapsed: !!n.data.isCollapsed },
+          })),
+          edges: edges,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+
+        const updatedList = get().mapList.map((m) =>
+          m.id === currentMapId ? { ...m, name: currentMapName, updatedAt: new Date() } : m
+        );
+        set({ mapList: updatedList, isDirty: false });
+      } catch (e) {
+        console.error("Error saving map to cloud:", e);
+      } finally {
+        set({ isSaving: false });
+      }
+    },
+
+    createNewCloudMap: async (userId, name = "Untitled Mind Map") => {
+      if (!userId) return null;
+      try {
+        set({ isLoadingCloud: true });
+        const newDocRef = doc(collection(db, "mindmaps"));
+        const newId = newDocRef.id;
+
+        const handlers = getHandlers();
+        const defaultRoot: MindMapNode = {
+          id: "root",
+          type: "mindmap",
+          position: { x: 0, y: 0 },
+          data: {
+            label: "Central Idea",
+            isRoot: true,
+            onLabelChange: handlers.onLabelChange,
+            onAddChild: handlers.onAddChild,
+            onAddSibling: handlers.onAddSibling,
+            onDeleteNode: handlers.onDeleteNode,
+            onAddParent: handlers.onAddParent,
+            onToggleCollapse: handlers.onToggleCollapse,
+          },
+        };
+
+        await setDoc(newDocRef, {
+          id: newId,
+          userId: userId,
+          name: name,
+          direction: "LR",
+          nodes: [{
+            id: defaultRoot.id,
+            position: defaultRoot.position,
+            data: {
+              label: defaultRoot.data.label,
+              isRoot: defaultRoot.data.isRoot,
+              isCollapsed: defaultRoot.data.isCollapsed
+            },
+          }],
+          edges: [],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        set({
+          currentMapId: newId,
+          currentMapName: name,
+          nodes: [defaultRoot],
+          edges: [],
+          direction: "LR",
+          isDirty: false,
+        });
+
+        await get().fetchUserMaps(userId);
+        return newId;
+      } catch (e) {
+        console.error("Error creating new cloud map:", e);
+        return null;
+      } finally {
+        set({ isLoadingCloud: false });
+      }
+    },
+
+    deleteCloudMap: async (userId, id) => {
+      if (!userId) return;
+      try {
+        await deleteDoc(doc(db, "mindmaps", id));
+        
+        if (get().currentMapId === id) {
+          const remaining = get().mapList.filter((m) => m.id !== id);
+          if (remaining.length > 0) {
+            await get().selectMap(userId, remaining[0].id);
+          } else {
+            await get().createNewCloudMap(userId);
+          }
+        } else {
+          await get().fetchUserMaps(userId);
+        }
+      } catch (e) {
+        console.error("Error deleting cloud map:", e);
+      }
+    },
+
+    renameCloudMap: async (userId, id, name) => {
+      if (!userId) return;
+      try {
+        const docRef = doc(db, "mindmaps", id);
+        await updateDoc(docRef, {
+          name: name,
+          updatedAt: serverTimestamp(),
+        });
+
+        if (get().currentMapId === id) {
+          set({ currentMapName: name });
+        }
+
+        await get().fetchUserMaps(userId);
+      } catch (e) {
+        console.error("Error renaming cloud map:", e);
+      }
+    },
+
+    syncWithCloudAndLocal: async (userId) => {
+      if (!userId) {
+        set({ currentMapId: null, currentMapName: "Local Map", mapList: [] });
+        get().initStore();
+        return;
+      }
+
+      try {
+        set({ isLoadingCloud: true });
+        const q = query(
+          collection(db, "mindmaps"),
+          where("userId", "==", userId)
+        );
+        const querySnapshot = await getDocs(q);
+        const maps = querySnapshot.docs.map((docSnap) => {
+          const data = docSnap.data();
+          let updatedAtDate: Date;
+          if (data.updatedAt && typeof data.updatedAt.toDate === "function") {
+            updatedAtDate = data.updatedAt.toDate();
+          } else if (data.updatedAt && data.updatedAt.seconds) {
+            updatedAtDate = new Date(data.updatedAt.seconds * 1000);
+          } else if (data.updatedAt) {
+            updatedAtDate = new Date(data.updatedAt);
+          } else {
+            updatedAtDate = new Date(0);
+          }
+          return {
+            id: docSnap.id,
+            name: data.name || "Untitled Mind Map",
+            updatedAt: updatedAtDate,
+          };
+        });
+
+        // Ensure maps are sorted descending by updatedAt in memory
+        maps.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+
+        set({ mapList: maps });
+
+        if (maps.length > 0) {
+          await get().selectMap(userId, maps[0].id);
+        } else {
+          // Sync existing work from localStorage first so they don't lose it on login
+          const saved = localStorage.getItem(STORAGE_KEY);
+          let name = "My Mind Map";
+          let localNodes: MindMapNode[] = [];
+          let localEdges: MindMapEdge[] = [];
+          let localDir: LayoutDirection = "LR";
+
+          if (saved) {
+            try {
+              const parsed = JSON.parse(saved);
+              if (parsed.nodes && parsed.nodes.length > 0) {
+                localNodes = parsed.nodes;
+                localEdges = parsed.edges || [];
+                localDir = parsed.direction || "LR";
+              }
+            } catch (e) {
+              console.warn("Parse local state in sync failed:", e);
+            }
+          }
+
+          const newDocRef = doc(collection(db, "mindmaps"));
+          const newId = newDocRef.id;
+
+          const uploadNodes = localNodes.length > 0 ? localNodes : [{
+            id: "root",
+            position: { x: 0, y: 0 },
+            data: { label: "Central Idea", isRoot: true }
+          }];
+
+          await setDoc(newDocRef, {
+            id: newId,
+            userId: userId,
+            name: name,
+            direction: localDir,
+            nodes: uploadNodes.map((n: any) => ({
+              id: n.id,
+              position: n.position,
+              data: { label: n.data.label, isRoot: !!n.data.isRoot, isCollapsed: !!n.data.isCollapsed },
+            })),
+            edges: localEdges,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          set({
+            currentMapId: newId,
+            currentMapName: name,
+            direction: localDir,
+            isDirty: false,
+          });
+
+          const handlers = getHandlers();
+          const loadedNodes: any[] = uploadNodes.map((n: any) => ({
+            id: n.id,
+            type: "mindmap",
+            position: n.position || { x: 0, y: 0 },
+            data: {
+              label: n.data?.label || "Topic",
+              isRoot: !!n.data?.isRoot,
+              isCollapsed: !!n.data?.isCollapsed,
+            },
+          }));
+
+          const loadedEdges: MindMapEdge[] = localEdges.map((e: any) => ({
+            ...e,
+            style: e.style || { stroke: "#6366f1", strokeWidth: 2 },
+          }));
+
+          get().setElements(loadedNodes, loadedEdges);
+          get().triggerAutoLayout(localDir);
+          await get().fetchUserMaps(userId);
+        }
+      } catch (e) {
+        console.error("Error synchronizing maps with Firebase:", e);
+      } finally {
+        set({ isLoadingCloud: false });
       }
     },
   };

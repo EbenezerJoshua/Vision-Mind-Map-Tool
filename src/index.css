@@ -1,13 +1,13 @@
 @import "tailwindcss";
 
-/* React Flow Controls custom glassmorphism */
+/* React Flow Controls custom glassmorphism (Light Mode by default) */
 .react-flow__controls {
-  background: rgba(15, 23, 42, 0.35) !important;
+  background: rgba(255, 255, 255, 0.92) !important;
   backdrop-filter: blur(20px) !important;
   -webkit-backdrop-filter: blur(20px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border: 1px solid rgba(15, 23, 42, 0.12) !important;
   border-radius: 12px !important;
-  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7) !important;
+  box-shadow: 0 4px 20px -5px rgba(0, 0, 0, 0.1) !important;
   overflow: hidden !important;
   display: flex !important;
   flex-direction: column !important;
@@ -27,15 +27,15 @@
   align-items: center !important;
   justify-content: center !important;
   transition: all 0.2s ease !important;
-  color: #ffffff !important;
+  color: #0f172a !important;
 }
 
 .react-flow__controls-button:hover {
-  background: rgba(255, 255, 255, 0.06) !important;
+  background: rgba(15, 23, 42, 0.06) !important;
 }
 
 .react-flow__controls-button svg {
-  fill: #ffffff !important;
+  fill: #0f172a !important;
   opacity: 0.85 !important;
   transition: opacity 0.2s ease !important;
   width: 14px !important;
@@ -49,10 +49,35 @@
 
 /* Style the MiniMap in same Glassmorphic flavor */
 .react-flow__minimap {
-  background: rgba(15, 23, 42, 0.35) !important;
+  background: rgba(255, 255, 255, 0.92) !important;
   backdrop-filter: blur(20px) !important;
   -webkit-backdrop-filter: blur(20px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border: 1px solid rgba(15, 23, 42, 0.12) !important;
   border-radius: 16px !important;
+  box-shadow: 0 4px 20px -5px rgba(0, 0, 0, 0.1) !important;
+}
+
+/* React Flow Controls custom glassmorphism (Dark Mode Overrides) */
+.dark .react-flow__controls {
+  background: rgba(15, 23, 42, 0.55) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7) !important;
+}
+
+.dark .react-flow__controls-button {
+  color: #ffffff !important;
+}
+
+.dark .react-flow__controls-button:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+
+.dark .react-flow__controls-button svg {
+  fill: #ffffff !important;
+}
+
+.dark .react-flow__minimap {
+  background: rgba(15, 23, 42, 0.55) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
   box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7) !important;
 }

@@ -20,6 +20,7 @@
     "dagre": "^0.8.5",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "firebase": "^12.15.0",
     "html-to-image": "^1.11.13",
     "jspdf": "^4.2.1",
     "lucide-react": "^0.546.0",

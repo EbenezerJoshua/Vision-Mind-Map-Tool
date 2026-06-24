@@ -52,41 +52,74 @@ async function startServer() {
         Do not add markdown backticks (\`\`\`json) or any conversational text. Return only the JSON object.
       `;
 
-      // Utilize 'gemini-3.5-flash' for robust multi-modal structure extraction
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: [
-          {
-            inlineData: {
-              mimeType,
-              data: base64Data,
-            },
-          },
-          prompt,
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              nodes: {
-                type: Type.ARRAY,
-                description: "Array of extracted mindmap nodes",
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING, description: "Unique sequential identifier, e.g. '1', '2', '3'" },
-                    label: { type: Type.STRING, description: "Clean descriptive text of this node" },
-                    parentId: { type: Type.STRING, description: "The parent node's ID. MUST be omitted or set to null ONLY for the central root node." },
-                  },
-                  required: ["id", "label"],
-                },
+      // Utilize a highly resilient retry & fallback mechanism to survive transient 503 or rate-limiting errors
+      const responseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          nodes: {
+            type: Type.ARRAY,
+            description: "Array of extracted mindmap nodes",
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                id: { type: Type.STRING, description: "Unique sequential identifier, e.g. '1', '2', '3'" },
+                label: { type: Type.STRING, description: "Clean descriptive text of this node" },
+                parentId: { type: Type.STRING, description: "The parent node's ID. MUST be omitted or set to null ONLY for the central root node." },
               },
+              required: ["id", "label"],
             },
-            required: ["nodes"],
           },
         },
-      });
+        required: ["nodes"],
+      };
+
+      const modelsToTry = ["gemini-3.5-flash", "gemini-flash-latest"];
+      let response = null;
+      let lastError: any = null;
+
+      for (const modelName of modelsToTry) {
+        const attempts = 3;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          try {
+            console.log(`[VisionMap Server] Attempting analysis with model: ${modelName} (Attempt ${attempt}/${attempts})`);
+            response = await ai.models.generateContent({
+              model: modelName,
+              contents: [
+                {
+                  inlineData: {
+                    mimeType,
+                    data: base64Data,
+                  },
+                },
+                prompt,
+              ],
+              config: {
+                responseMimeType: "application/json",
+                responseSchema,
+              },
+            });
+            break; // Succeeded! Break out of attempts loop
+          } catch (err: any) {
+            lastError = err;
+            console.warn(
+              `[VisionMap Server] Error on model ${modelName} during attempt ${attempt}:`,
+              err.message || err
+            );
+            if (attempt < attempts) {
+              // Exponential backoff: 2s, 4s
+              const delay = Math.pow(2, attempt) * 1000;
+              await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+          }
+        }
+        if (response) {
+          break; // Succeeded! Break out of models loop
+        }
+      }
+
+      if (!response) {
+        throw lastError || new Error("Failed to process image through all available models and retries.");
+      }
 
       const textOutput = response.text;
       if (!textOutput) {
